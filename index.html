@@ -13,6 +13,16 @@
 </script>
 </head>
 <body>
+<script>
+// Debug: shows any error as red text on the page
+function showErr(msg) {
+  document.body.insertAdjacentHTML('beforeend',
+    '<pre style="position:fixed;top:0;left:0;right:0;z-index:99;margin:0;color:#f55;background:#000;font-size:18px;white-space:pre-wrap;padding:10px">' + msg + '</pre>');
+}
+window.addEventListener('error', e => showErr((e.message || 'error') + ' @ line ' + e.lineno));
+window.addEventListener('unhandledrejection', e => showErr('Promise error: ' + e.reason));
+</script>
+
 <script type="module">
 import * as THREE from 'three';
 import { VRButton } from 'three/addons/webxr/VRButton.js';
@@ -37,4 +47,122 @@ scene.add(ambient);
 const groundMat = new THREE.MeshStandardMaterial({ color: 0x3a7d44 });
 const ground = new THREE.Mesh(new THREE.CircleGeometry(20, 48), groundMat);
 ground.rotation.x = -Math.PI / 2;
-scene.ad
+scene.add(ground);
+
+const treeMat = new THREE.MeshStandardMaterial({ color: 0x2e6b3a });
+for (let i = 0; i < 14; i++) {
+  const a = (i / 14) * Math.PI * 2, r = 3 + Math.random() * 4;
+  const tree = new THREE.Mesh(new THREE.ConeGeometry(0.5, 1.6, 8), treeMat);
+  tree.position.set(Math.cos(a) * r, 0.8, Math.sin(a) * r);
+  scene.add(tree);
+}
+
+// Falling particles (rain / snow)
+const N = 800;
+const pos = new Float32Array(N * 3);
+for (let i = 0; i < N; i++) {
+  pos[i * 3] = (Math.random() - 0.5) * 16;
+  pos[i * 3 + 1] = Math.random() * 8;
+  pos[i * 3 + 2] = (Math.random() - 0.5) * 16;
+}
+const geo = new THREE.BufferGeometry();
+geo.setAttribute('position', new THREE.BufferAttribute(pos, 3));
+const pMat = new THREE.PointsMaterial({ color: 0xffffff, size: 0.04, transparent: true, opacity: 0 });
+scene.add(new THREE.Points(geo, pMat));
+
+// ---------- Worlds (what each sign changes) ----------
+const C = (h) => new THREE.Color(h);
+const WORLDS = {
+  sunny: { sky: C(0x87ceeb), ground: C(0x3a7d44), p: C(0xffffff), sun: 1.2,  amb: 0.7,  fall: 0,   op: 0 },
+  storm: { sky: C(0x2b2f3a), ground: C(0x2a3b2d), p: C(0x9ec5ff), sun: 0.3,  amb: 0.25, fall: 9,   op: 0.8 },
+  snow:  { sky: C(0xcfe3f0), ground: C(0xf2f6f8), p: C(0xffffff), sun: 0.8,  amb: 0.7,  fall: 1.2, op: 1 },
+  night: { sky: C(0x070b24), ground: C(0x1c2a3a), p: C(0xffffff), sun: 0.15, amb: 0.25, fall: 0,   op: 0 },
+};
+let current = 'sunny';
+const skyCol = WORLDS.sunny.sky.clone();
+scene.background = skyCol;
+let fallSpeed = 0;
+
+// ---------- Hands ----------
+const factory = new XRHandModelFactory();
+const hands = [0, 1].map((i) => {
+  const h = renderer.xr.getHand(i);
+  h.add(factory.createHandModel(h, 'spheres'));
+  scene.add(h);
+  return h;
+});
+
+const FINGERS = ['index', 'middle', 'ring', 'pinky'];
+
+// Finger is extended if the tip is much farther from the wrist than the knuckle
+function extended(hand, f) {
+  const w = hand.joints['wrist'];
+  const p = hand.joints[`${f}-finger-phalanx-proximal`];
+  const t = hand.joints[`${f}-finger-tip`];
+  if (!w || !p || !t) return null;
+  return w.position.distanceTo(t.position) > w.position.distanceTo(p.position) * 1.5;
+}
+
+function classify(hand) {
+  const e = FINGERS.map((f) => extended(hand, f));
+  if (e.includes(null)) return null;
+  const [i, m, r, p] = e;
+  const n = e.filter(Boolean).length;
+  if (n === 0) return 'storm';              // fist
+  if (n === 4) return 'sunny';              // open palm
+  if (i && m && !r && !p) return 'night';   // peace sign
+  if (i && !m && !r && !p) return 'snow';   // pointing
+  return null;
+}
+
+// ---------- Loop ----------
+const clock = new THREE.Clock();
+const HOLD_MS = 300;
+// Each hand is tracked separately
+const state = hands.map(() => ({ cand: null, since: 0, fired: false }));
+
+renderer.setAnimationLoop((time) => {
+  const dt = Math.min(clock.getDelta(), 0.05);
+
+  // Detect signs per hand; each fires once when held
+  hands.forEach((h, i) => {
+    const st = state[i];
+    const s = h.visible ? classify(h) : null;
+    if (s !== st.cand) { st.cand = s; st.since = time; st.fired = false; }
+    else if (s && !st.fired && time - st.since > HOLD_MS) {
+      current = s;
+      st.fired = true;
+    }
+  });
+
+  // Smoothly blend toward the current world
+  const W = WORLDS[current];
+  const k = 1 - Math.exp(-dt * 2);
+  skyCol.lerp(W.sky, k);
+  groundMat.color.lerp(W.ground, k);
+  pMat.color.lerp(W.p, k);
+  sun.intensity += (W.sun - sun.intensity) * k;
+  ambient.intensity += (W.amb - ambient.intensity) * k;
+  pMat.opacity += (W.op - pMat.opacity) * k;
+  fallSpeed += (W.fall - fallSpeed) * k;
+
+  // Move particles
+  const a = geo.attributes.position;
+  for (let i = 0; i < N; i++) {
+    let y = a.getY(i) - fallSpeed * dt;
+    if (y < 0) y = 8;
+    a.setY(i, y);
+  }
+  a.needsUpdate = true;
+
+  renderer.render(scene, camera);
+});
+
+addEventListener('resize', () => {
+  camera.aspect = innerWidth / innerHeight;
+  camera.updateProjectionMatrix();
+  renderer.setSize(innerWidth, innerHeight);
+});
+</script>
+</body>
+</html>
